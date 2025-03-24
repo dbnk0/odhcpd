@@ -31,7 +31,8 @@ struct vlist_tree leases = VLIST_TREE_INIT(leases, lease_cmp, lease_update, true
 AVL_TREE(interfaces, avl_strcmp, false, NULL);
 struct config config = {.legacy = false, .main_dhcpv4 = false,
 			.dhcp_cb = NULL, .dhcp_statefile = NULL, .dhcp_hostsfile = NULL,
-			.log_level = LOG_WARNING};
+			.log_level = LOG_WARNING, .ra_static_routes = NULL,
+			.ra_static_routes_cnt = 0};
 
 #define START_DEFAULT	100
 #define LIMIT_DEFAULT	150
@@ -103,6 +104,7 @@ enum {
 	IFACE_ATTR_RA_HOPLIMIT,
 	IFACE_ATTR_RA_MTU,
 	IFACE_ATTR_RA_DNS,
+	IFACE_ATTR_RA_STATICROUTE,
 	IFACE_ATTR_RA_PREF64,
 	IFACE_ATTR_PD_MANAGER,
 	IFACE_ATTR_PD_CER,
@@ -159,6 +161,7 @@ static const struct blobmsg_policy iface_attrs[IFACE_ATTR_MAX] = {
 	[IFACE_ATTR_RA_HOPLIMIT] = { .name = "ra_hoplimit", .type = BLOBMSG_TYPE_INT32 },
 	[IFACE_ATTR_RA_MTU] = { .name = "ra_mtu", .type = BLOBMSG_TYPE_INT32 },
 	[IFACE_ATTR_RA_DNS] = { .name = "ra_dns", .type = BLOBMSG_TYPE_BOOL },
+	[IFACE_ATTR_RA_STATICROUTE] = { .name = "ra_staticroute", .type = BLOBMSG_TYPE_ARRAY },
 	[IFACE_ATTR_RA_PREF64] = { .name = "ra_pref64", .type = BLOBMSG_TYPE_STRING },
 	[IFACE_ATTR_NDPROXY_ROUTING] = { .name = "ndproxy_routing", .type = BLOBMSG_TYPE_BOOL },
 	[IFACE_ATTR_NDPROXY_SLAVE] = { .name = "ndproxy_slave", .type = BLOBMSG_TYPE_BOOL },
@@ -200,6 +203,7 @@ enum {
 	ODHCPD_ATTR_LEASETRIGGER,
 	ODHCPD_ATTR_LOGLEVEL,
 	ODHCPD_ATTR_HOSTSFILE,
+	ODHCPD_ATTR_RA_STATICROUTE,
 	ODHCPD_ATTR_MAX
 };
 
@@ -210,6 +214,7 @@ static const struct blobmsg_policy odhcpd_attrs[ODHCPD_ATTR_MAX] = {
 	[ODHCPD_ATTR_LEASETRIGGER] = { .name = "leasetrigger", .type = BLOBMSG_TYPE_STRING },
 	[ODHCPD_ATTR_LOGLEVEL] = { .name = "loglevel", .type = BLOBMSG_TYPE_INT32 },
 	[ODHCPD_ATTR_HOSTSFILE] = { .name = "hostsfile", .type = BLOBMSG_TYPE_STRING },
+	[ODHCPD_ATTR_RA_STATICROUTE] = { .name = "ra_staticroute", .type = BLOBMSG_TYPE_ARRAY },
 };
 
 const struct uci_blob_param_list odhcpd_attr_list = {
@@ -285,6 +290,7 @@ static void clean_interface(struct interface *iface)
 	free(iface->dhcpv4_router);
 	free(iface->dhcpv4_dns);
 	free(iface->dhcpv6_raw);
+	free(iface->ra_static_routes);
 	free(iface->filter_class);
 	free(iface->dhcpv4_ntp);
 	free(iface->dhcpv6_ntp);
@@ -364,6 +370,63 @@ static int parse_ra_flags(uint8_t *flags, struct blob_attr *attr)
 	return 0;
 }
 
+/* Returns 0 on success, -1 on invalid value, -2 on memory error
+(`routes` is unmodified in that case) */
+static int parse_append_ra_staticroute(struct blob_attr *attr,
+	struct odhcpd_ip6prefix **routes, size_t *routes_cnt)
+{
+	if (blobmsg_type(attr) != BLOBMSG_TYPE_STRING ||
+	    !blobmsg_check_attr(attr, false)) {
+		return -1;
+	}
+
+	const char *str = blobmsg_get_string(attr);
+	struct odhcpd_ip6prefix prefix;
+
+	/* Parse the address and prefix length */
+	if (odhcpd_parse_addr6_prefix(str, &prefix.addr, &prefix.len) < 0) {
+		return -1;
+	}
+
+	/*
+	 * Validate prefix length
+	 * Default route (::/0) is managed elsewhere.
+	 */
+	if (prefix.len == 0 || prefix.len > 128) {
+		return -1;
+	}
+
+	/* Get network address (zero out host bits) */
+	if (!odhcpd_addr6_to_network(&prefix.addr, prefix.len, &prefix.addr)) {
+		/* Should never fail */
+		return -1;
+	}
+
+	/*
+	 * Validate address
+	 * Zero-address (::) specifies default route and is managed elsewhere,
+	 * loopback and link-local addresses are not routable.
+	 */
+	if (IN6_IS_ADDR_UNSPECIFIED(&prefix.addr) ||
+	    IN6_IS_ADDR_LOOPBACK(&prefix.addr) ||
+	    IN6_IS_ADDR_LINKLOCAL(&prefix.addr)) {
+		return -1;
+	}
+
+	/* Append the prefix to the list */
+	struct odhcpd_ip6prefix *tmp = realloc(*routes, (*routes_cnt + 1) *
+					       sizeof(**routes));
+	if (!tmp) {
+		return -2;
+	}
+
+	*routes = tmp;
+	(*routes)[*routes_cnt] = prefix;
+	++(*routes_cnt);
+
+	return 0;
+}
+
 static void set_config(struct uci_section *s)
 {
 	struct blob_attr *tb[ODHCPD_ATTR_MAX], *c;
@@ -399,6 +462,41 @@ static void set_config(struct uci_section *s)
 		if (config.log_level != log_level) {
 			config.log_level = log_level;
 			setlogmask(LOG_UPTO(config.log_level));
+		}
+	}
+
+	if ((c = tb[ODHCPD_ATTR_RA_STATICROUTE])) {
+		free(config.ra_static_routes);
+		config.ra_static_routes = NULL;
+		config.ra_static_routes_cnt = 0;
+
+		struct blob_attr *cur;
+		unsigned rem;
+
+		blobmsg_for_each_attr(cur, c, rem) {
+			/* Parse and append the route */
+			int ec = parse_append_ra_staticroute(
+				cur, &(config.ra_static_routes),
+				&(config.ra_static_routes_cnt));
+
+			if (ec == -1) {
+				/* Invalid value */
+				char default_str[] = "?";
+				char *str = default_str;
+				if (blobmsg_type(cur) == BLOBMSG_TYPE_STRING &&
+				    blobmsg_check_attr(cur, false)) {
+					str = blobmsg_get_string(cur);
+				}
+				syslog(LOG_WARNING, "Invalid %s value (%s), "
+				       "ignoring this route",
+				       odhcpd_attrs[ODHCPD_ATTR_RA_STATICROUTE].name,
+				       str);
+			} else if (ec == -2) {
+				/* Memory error */
+				syslog(LOG_ERR, "Memory allocation failed for %s",
+				       odhcpd_attrs[ODHCPD_ATTR_RA_STATICROUTE].name);
+				break;
+			}
 		}
 	}
 }
@@ -1316,6 +1414,37 @@ int config_parse_interface(void *data, size_t len, const char *name, bool overwr
 
 	if ((c = tb[IFACE_ATTR_RA_DNS]))
 		iface->ra_dns = blobmsg_get_bool(c);
+
+	if ((c = tb[IFACE_ATTR_RA_STATICROUTE])) {
+		struct blob_attr *cur;
+		unsigned rem;
+
+		blobmsg_for_each_attr(cur, c, rem) {
+			/* Parse and append the route */
+			int ec = parse_append_ra_staticroute(
+				cur, &(iface->ra_static_routes),
+				&(iface->ra_static_routes_cnt));
+
+			if (ec == -1) {
+				/* Invalid value */
+				char default_str[] = "?";
+				char *str = default_str;
+				if (blobmsg_type(cur) == BLOBMSG_TYPE_STRING &&
+				    blobmsg_check_attr(cur, false)) {
+					str = blobmsg_get_string(cur);
+				}
+				syslog(LOG_WARNING, "Invalid %s value (%s) for "
+				       "interface '%s', ignoring this route",
+				       odhcpd_attrs[ODHCPD_ATTR_RA_STATICROUTE].name,
+				       str, iface->name);
+			} else if (ec == -2) {
+				/* Memory error */
+				syslog(LOG_ERR, "Memory allocation failed for %s",
+				       odhcpd_attrs[ODHCPD_ATTR_RA_STATICROUTE].name);
+				break;
+			}
+		}
+	}
 
 	if ((c = tb[IFACE_ATTR_DNR])) {
 		struct blob_attr *cur;
